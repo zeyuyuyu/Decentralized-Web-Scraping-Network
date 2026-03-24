@@ -1,106 +1,101 @@
 import asyncio
 import aiohttp
-import random
+from datetime import datetime
+import redis
+from ratelimit import limits, sleep_and_retry
 from typing import Dict, List, Optional
-from dataclasses import dataclass
-
-@dataclass
-class ScrapeRequest:
-    url: str
-    headers: Optional[Dict[str, str]] = None
-    proxy: Optional[str] = None
-
-@dataclass
-class ScrapeResponse:
-    url: str
-    status: int
-    content: str
-    error: Optional[str] = None
 
 class ScraperNode:
-    def __init__(self, node_id: str, max_concurrent: int = 10,
-                 rate_limit_per_second: float = 2.0):
+    def __init__(self, node_id: str, redis_url: str):
         self.node_id = node_id
+        self.redis_client = redis.Redis.from_url(redis_url)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.rate_limit = rate_limit_per_second
-        self.last_request_time = 0.0
-        self.proxy_list: List[str] = []
+        self.rate_limits: Dict[str, int] = {}
 
-    async def init_session(self):
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+    async def initialize(self):
+        self.session = aiohttp.ClientSession()
+        await self.register_node()
 
-    async def close(self):
+    async def shutdown(self):
         if self.session:
             await self.session.close()
-            self.session = None
+        await self.deregister_node()
 
-    def add_proxies(self, proxies: List[str]):
-        self.proxy_list.extend(proxies)
+    async def register_node(self):
+        self.redis_client.sadd('active_nodes', self.node_id)
+        self.redis_client.hset(f'node:{self.node_id}', 'last_heartbeat', datetime.now().timestamp())
 
-    async def _rate_limit_delay(self):
-        now = asyncio.get_event_loop().time()
-        time_since_last = now - self.last_request_time
-        delay = max(0, (1 / self.rate_limit) - time_since_last)
-        if delay > 0:
-            await asyncio.sleep(delay)
-        self.last_request_time = now
+    async def deregister_node(self):
+        self.redis_client.srem('active_nodes', self.node_id)
+        self.redis_client.delete(f'node:{self.node_id}')
 
-    async def scrape(self, request: ScrapeRequest) -> ScrapeResponse:
-        await self.init_session()
+    @sleep_and_retry
+    @limits(calls=60, period=60)
+    async def rate_limited_request(self, url: str) -> dict:
+        domain = url.split('/')[2]
         
-        async with self.semaphore:
-            await self._rate_limit_delay()
-            
-            try:
-                proxy = request.proxy or (random.choice(self.proxy_list) if self.proxy_list else None)
-                headers = request.headers or {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        # Get domain-specific rate limit
+        domain_key = f'ratelimit:{domain}'
+        if domain not in self.rate_limits:
+            limit = self.redis_client.get(domain_key)
+            self.rate_limits[domain] = int(limit) if limit else 60
+
+        # Distributed rate limiting using Redis
+        current = self.redis_client.incr(f'requests:{domain}')
+        if current > self.rate_limits[domain]:
+            await asyncio.sleep(1)
+            self.redis_client.decr(f'requests:{domain}')
+            raise Exception(f'Rate limit exceeded for {domain}')
+
+        try:
+            async with self.session.get(url) as response:
+                return {
+                    'url': url,
+                    'status': response.status,
+                    'content': await response.text(),
+                    'timestamp': datetime.now().isoformat()
                 }
+        except Exception as e:
+            return {
+                'url': url,
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
 
-                async with self.session.get(
-                    request.url,
-                    headers=headers,
-                    proxy=proxy,
-                    timeout=30
-                ) as response:
-                    content = await response.text()
-                    return ScrapeResponse(
-                        url=request.url,
-                        status=response.status,
-                        content=content
-                    )
+    async def heartbeat(self):
+        while True:
+            self.redis_client.hset(
+                f'node:{self.node_id}',
+                'last_heartbeat',
+                datetime.now().timestamp()
+            )
+            await asyncio.sleep(30)
 
+    async def process_queue(self):
+        while True:
+            # Pop URL from distributed queue
+            url = self.redis_client.lpop('scrape_queue')
+            if not url:
+                await asyncio.sleep(1)
+                continue
+
+            # Process URL with rate limiting
+            try:
+                result = await self.rate_limited_request(url.decode('utf-8'))
+                self.redis_client.rpush('results_queue', str(result))
             except Exception as e:
-                return ScrapeResponse(
-                    url=request.url,
-                    status=500,
-                    content='',
-                    error=str(e)
-                )
+                self.redis_client.rpush('failed_queue', url)
 
-    async def process_batch(self, requests: List[ScrapeRequest]) -> List[ScrapeResponse]:
-        tasks = [self.scrape(req) for req in requests]
-        return await asyncio.gather(*tasks)
+    async def run(self):
+        await self.initialize()
+        try:
+            await asyncio.gather(
+                self.heartbeat(),
+                self.process_queue()
+            )
+        finally:
+            await self.shutdown()
 
-# Example usage:
-'''
-async def main():
-    node = ScraperNode('node-1', max_concurrent=5, rate_limit_per_second=1.0)
-    node.add_proxies(['http://proxy1:8080', 'http://proxy2:8080'])
-    
-    requests = [
-        ScrapeRequest('http://example.com'),
-        ScrapeRequest('http://example.org')
-    ]
-    
-    responses = await node.process_batch(requests)
-    for resp in responses:
-        print(f"URL: {resp.url}, Status: {resp.status}")
-    
-    await node.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-'''
+if __name__ == '__main__':
+    node = ScraperNode('node1', 'redis://localhost:6379')
+    asyncio.run(node.run())
